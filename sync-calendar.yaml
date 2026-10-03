@@ -1,0 +1,82 @@
+name: Sync ChurchTrac calendar
+
+# Intended for the separate calendar-cache repository, on its default branch.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-calendar
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download and validate calendar
+        env:
+          CALENDAR_ICAL_URL: ${{ vars.CALENDAR_ICAL_URL || 'https://www.churchtrac.com/ical?ui=E6511E07' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          download="$RUNNER_TEMP/calendar-download.ics"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 60 \
+            --retry 2 --retry-delay 5 \
+            --header 'Accept: text/calendar' \
+            --header 'Accept-Language: en-US' \
+            "$CALENDAR_ICAL_URL" --output "$download"
+
+          python3 - "$download" <<'PY'
+          import pathlib
+          import sys
+
+          source = pathlib.Path(sys.argv[1])
+          content = source.read_text(encoding="utf-8-sig")
+          lines = content.splitlines()
+          if not lines or lines[0] != "BEGIN:VCALENDAR" or lines[-1] != "END:VCALENDAR":
+              raise SystemExit("Invalid calendar: missing VCALENDAR boundaries; previous feed preserved")
+          if "VERSION:2.0" not in lines:
+              raise SystemExit("Invalid calendar: missing VERSION:2.0; previous feed preserved")
+          stack = []
+          events = 0
+          for line in lines:
+              if line.startswith("BEGIN:"):
+                  component = line[6:]
+                  stack.append(component)
+                  if component == "VEVENT":
+                      events += 1
+              elif line.startswith("END:"):
+                  if not stack or stack.pop() != line[4:]:
+                      raise SystemExit("Invalid calendar: mismatched component boundaries")
+          if stack:
+              raise SystemExit("Invalid calendar: unfinished component")
+          # A valid empty calendar is allowed: all events may have been removed.
+          pathlib.Path("calendar.ics").write_bytes(source.read_bytes())
+          print(f"Validated calendar with {events} event entries")
+          PY
+
+      - name: Commit updated feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- calendar.ics
+          if git diff --cached --quiet; then
+            echo 'Calendar content unchanged'
+            exit 0
+          fi
+          git commit -m 'Update cached ChurchTrac calendar'
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
